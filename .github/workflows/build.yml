@@ -1,0 +1,176 @@
+name: Build Tesseract Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt update
+          sudo apt install -y automake ca-certificates g++ git libtool make pkg-config \
+                              libpng-dev libjpeg-dev libtiff-dev zlib1g-dev \
+                              libicu-dev libpango1.0-dev libcairo2-dev libleptonica-dev
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install automake pkg-config icu4c leptonica pango cairo
+          echo "PKG_CONFIG_PATH=$(brew --prefix icu4c)/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
+          echo "CMAKE_PREFIX_PATH=$(brew --prefix icu4c)" >> $GITHUB_ENV
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install -y cmake
+          git clone https://github.com/Microsoft/vcpkg.git
+          cd vcpkg
+          .\bootstrap-vcpkg.bat
+          .\vcpkg install leptonica:x64-windows libpng:x64-windows libjpeg-turbo:x64-windows tiff:x64-windows zlib:x64-windows icu:x64-windows
+          echo "VCPKG_ROOT=${{ github.workspace }}\vcpkg" >> $env:GITHUB_ENV
+          echo "CMAKE_TOOLCHAIN_FILE=${{ github.workspace }}\vcpkg\scripts\buildsystems\vcpkg.cmake" >> $env:GITHUB_ENV
+
+      - name: Download language models
+        shell: bash
+        run: |
+          mkdir -p tessdata
+          # Download essential English language model
+          curl -L -o tessdata/eng.traineddata https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata
+          # Download OSD (Orientation and Script Detection) model
+          curl -L -o tessdata/osd.traineddata https://github.com/tesseract-ocr/tessdata_fast/raw/main/osd.traineddata
+
+      - name: Clone and build Tesseract
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/tesseract-ocr/tesseract
+          cd tesseract
+          mkdir build && cd build
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$CMAKE_TOOLCHAIN_FILE" -DSW_BUILD=OFF
+          else
+            cmake .. -DCMAKE_BUILD_TYPE=Release
+          fi
+          cmake --build . --config Release
+
+      - name: Package binary
+        shell: bash
+        run: |
+          mkdir -p output
+          cd tesseract
+
+          # Debug: Show the build directory structure
+          echo "Build directory contents:"
+          find build -name "tesseract*" -type f 2>/dev/null || echo "No tesseract files found"
+
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            # On Windows with Visual Studio, binaries are in build/bin/Release/
+            if [ -f "build/bin/Release/tesseract.exe" ]; then
+              cp build/bin/Release/tesseract.exe ../output/
+            elif [ -f "build/Release/tesseract.exe" ]; then
+              cp build/Release/tesseract.exe ../output/
+            else
+              echo "tesseract.exe not found in expected Windows locations"
+              exit 1
+            fi
+            
+            # Copy vcpkg dependencies more systematically
+            echo "Copying vcpkg DLL dependencies..."
+            vcpkg_installed="${VCPKG_ROOT}/installed/x64-windows"
+            if [ -d "$vcpkg_installed/bin" ]; then
+              cp "$vcpkg_installed/bin"/*.dll ../output/ 2>/dev/null || true
+            fi
+            
+            # Copy any additional DLLs from the build directory
+            find build -name "*.dll" -exec cp {} ../output/ \; 2>/dev/null || true
+            
+            # Copy language models
+            mkdir -p ../output/tessdata
+            cp ../tessdata/*.traineddata ../output/tessdata/
+            
+            # Copy test script for Windows
+            cp ../test-installation.bat ../output/
+            
+          else
+            # On Linux and macOS, check multiple possible locations
+            if [ -f "build/tesseract" ]; then
+              cp build/tesseract ../output/
+            elif [ -f "build/bin/tesseract" ]; then
+              cp build/bin/tesseract ../output/
+            elif [ -f "build/src/tesseract" ]; then
+              cp build/src/tesseract ../output/
+            else
+              echo "tesseract binary not found in expected locations"
+              echo "Checking all possible locations:"
+              find build -name "tesseract" -type f
+              exit 1
+            fi
+            
+            # Copy language models for non-Windows platforms too
+            mkdir -p ../output/tessdata
+            cp ../tessdata/*.traineddata ../output/tessdata/
+          fi
+          cd ..
+
+      - name: Bundle and patch dynamic libraries (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -e
+          cd output
+          mkdir -p lib
+          brew_libs=(leptonica libpng libjpeg-turbo libtiff icu4c)
+          for lib in "${brew_libs[@]}"; do
+            brew_lib_path="$(brew --prefix $lib)/lib"
+            cp -v $brew_lib_path/*.dylib lib/ 2>/dev/null || true
+          done
+          for dylib in lib/*.dylib; do
+            name=$(basename "$dylib")
+            if otool -L tesseract | grep -q "$name"; then
+              old_path=$(otool -L tesseract | grep "$name" | awk '{print $1}')
+              install_name_tool -change "$old_path" "@executable_path/lib/$name" tesseract
+            fi
+          done
+          for dylib in lib/*.dylib; do
+            for dep in lib/*.dylib; do
+              dep_name=$(basename "$dep")
+              if otool -L "$dylib" | grep -q "$dep_name"; then
+                old_path=$(otool -L "$dylib" | grep "$dep_name" | awk '{print $1}')
+                install_name_tool -change "$old_path" "@executable_path/lib/$dep_name" "$dylib"
+              fi
+            done
+          done
+          echo "Final tesseract dependencies:"
+          otool -L tesseract
+
+      - name: Create archive
+        shell: bash
+        run: |
+          # Create platform-specific archive name for consistency with README
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            archive_name="tesseract-windows-latest.tar.gz"
+          elif [ "$RUNNER_OS" == "macOS" ]; then
+            archive_name="tesseract-macos-latest.tar.gz"
+          else
+            archive_name="tesseract-ubuntu-latest.tar.gz"
+          fi
+
+          tar -czf "$archive_name" -C output .
+
+      - name: Upload Release Artifact
+        uses: softprops/action-gh-release@v1
+        with:
+          files: tesseract-*-latest.tar.gz
